@@ -7,6 +7,8 @@
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <Preferences.h>
+#include <Wire.h>
+#include <MFRC522_I2C.h>
 
 constexpr uint32_t REFRESH_MS = 60UL * 1000UL;
 const char *CONSUMABLES[] = {"74LS04", "74LS08", "74LS32"};
@@ -14,11 +16,27 @@ constexpr size_t NUM_CONSUMABLES = sizeof(CONSUMABLES) / sizeof(CONSUMABLES[0]);
 int stock[NUM_CONSUMABLES] = {-1, -1, -1};
 int ids[NUM_CONSUMABLES] = {-1, -1, -1};
 int totals[NUM_CONSUMABLES] = {0, 0, 0};
+int companies[NUM_CONSUMABLES] = {-1, -1, -1};
+int activeUserCompany = -1;
 int pending[NUM_CONSUMABLES] = {0, 0, 0};
 uint32_t lastPressAt = 0;
 constexpr uint32_t DEBOUNCE_MS = 1500;
 uint32_t lastRefreshAt = 0;
 bool needsRedraw = true;
+
+// RFID 2 (WS1850S) en el puerto A (I2C): SDA=21, SCL=22, dirección 0x28.
+// El pin de reset no está cableado en la unidad, se usa un GPIO libre.
+constexpr uint8_t RFID_ADDR = 0x28;
+constexpr uint8_t RFID_RST_PIN = 2;
+constexpr uint32_t RFID_POLL_MS = 150;
+MFRC522_I2C rfid(RFID_ADDR, RFID_RST_PIN, &Wire);
+String lastUid = "";
+int activeUserId = -1;
+String activeUserName = "";
+bool unknownCard = false;
+uint32_t lastUserActivityAt = 0;
+constexpr uint32_t USER_TIMEOUT_MS = 30UL * 1000UL;
+uint32_t lastRfidPollAt = 0;
 
 void drawMessage(const char *l1, const char *l2);
 
@@ -226,7 +244,7 @@ void checkButton() {
 
 // Devuelve las unidades restantes del consumible, o -1 si falla
 int fetchConsumable(const String &baseUrl, const String &token, const char *name,
-                    int *outId = nullptr, int *outQty = nullptr) {
+                    int *outId = nullptr, int *outQty = nullptr, int *outCompany = nullptr) {
   String url = baseUrl + "/api/v1/consumables?limit=10&search=" + name;
   WiFiClientSecure secure;
   WiFiClient plain;
@@ -260,6 +278,7 @@ int fetchConsumable(const String &baseUrl, const String &token, const char *name
   filter["rows"][0]["name"] = true;
   filter["rows"][0]["qty"] = true;
   filter["rows"][0]["remaining"] = true;
+  filter["rows"][0]["company"]["id"] = true;
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, body, DeserializationOption::Filter(filter));
   if (err) {
@@ -277,24 +296,77 @@ int fetchConsumable(const String &baseUrl, const String &token, const char *name
   if (match.isNull()) return -1;
   if (outId) *outId = match["id"] | -1;
   if (outQty) *outQty = match["qty"] | 0;
+  if (outCompany) *outCompany = match["company"]["id"] | -1;
   return match["remaining"] | (match["qty"] | -1);
 }
 
+// Petición genérica a la API de Snipe-IT; devuelve el código HTTP (o -1)
+int snipeRequest(const String &baseUrl, const String &token, const char *method,
+                 const String &path, const String &payload, String &response) {
+  String endpoint = baseUrl + path;
+  WiFiClientSecure secure;
+  WiFiClient plain;
+  HTTPClient http;
+  http.setTimeout(10000);
+  bool ok;
+  if (endpoint.startsWith("https://")) {
+    secure.setInsecure();
+    ok = http.begin(secure, endpoint);
+  } else {
+    ok = http.begin(plain, endpoint);
+  }
+  if (!ok) return -1;
+
+  http.addHeader("Authorization", "Bearer " + token);
+  http.addHeader("Accept", "application/json");
+  http.addHeader("Content-Type", "application/json");
+  int code = http.sendRequest(method, payload);
+  response = http.getString();
+  http.end();
+  return code;
+}
+
+bool canCheckout(size_t i);
+
 void drawStock() {
   M5.Display.fillScreen(BLACK);
+  M5.Display.setTextSize(2);
+  M5.Display.setCursor(10, 8);
+  if (activeUserId >= 0) {
+    M5.Display.setTextColor(CYAN, BLACK);
+    M5.Display.print(activeUserName.substring(0, 24));
+  } else if (unknownCard) {
+    M5.Display.setTextColor(RED, BLACK);
+    M5.Display.print("Tarjeta desconocida");
+  } else {
+    M5.Display.setTextColor(WHITE, BLACK);
+    M5.Display.print("Sin usuario");
+  }
   M5.Display.setTextColor(WHITE, BLACK);
   M5.Display.setTextSize(3);
   for (size_t i = 0; i < NUM_CONSUMABLES; i++) {
-    M5.Display.setCursor(10, 30 + i * 60);
+    M5.Display.setCursor(10, 55 + i * 50);
     if (stock[i] < 0) {
       M5.Display.setTextColor(RED, BLACK);
       M5.Display.printf("%s: --", CONSUMABLES[i]);
     } else {
-      int shown = stock[i] - pending[i];
-      M5.Display.setTextColor(shown == 0 ? RED : (pending[i] ? YELLOW : GREEN), BLACK);
-      M5.Display.printf("%s: %d   ", CONSUMABLES[i], shown);
+      M5.Display.setTextColor(stock[i] == 0 ? RED : GREEN, BLACK);
+      M5.Display.printf("%s: %d", CONSUMABLES[i], stock[i]);
+      if (pending[i] > 0) {
+        M5.Display.setTextColor(YELLOW, BLACK);
+        M5.Display.printf(" -%d", pending[i]);
+      }
+      if (activeUserId >= 0 && companies[i] >= 0 && companies[i] != activeUserCompany) {
+        M5.Display.setTextColor(RED, BLACK);
+        M5.Display.print(" X");
+      }
+      M5.Display.print("      ");
     }
   }
+  M5.Display.setTextSize(2);
+  M5.Display.setTextColor(CYAN, BLACK);
+  M5.Display.setCursor(10, 210);
+  M5.Display.printf("UID: %-16s", lastUid.isEmpty() ? "--" : lastUid.c_str());
   needsRedraw = false;
 }
 
@@ -318,13 +390,14 @@ void refreshStock() {
   if (url.isEmpty() || token.isEmpty()) return;
 
   for (size_t i = 0; i < NUM_CONSUMABLES; i++) {
-    stock[i] = fetchConsumable(url, token, CONSUMABLES[i], &ids[i], &totals[i]);
+    stock[i] = fetchConsumable(url, token, CONSUMABLES[i], &ids[i], &totals[i], &companies[i]);
     Serial.printf("%s: %d\n", CONSUMABLES[i], stock[i]);
   }
   needsRedraw = true;
 }
 
-// Resta 1 a la cantidad total del consumible en Snipe-IT
+// Resta unidades del consumible en Snipe-IT. Con usuario activo hace un
+// checkout por unidad; sin usuario baja la cantidad total.
 void decrementConsumable(size_t i, int amount) {
   if (WiFi.status() != WL_CONNECTED || ids[i] < 0 || stock[i] <= 0) {
     Serial.printf("%s: no se puede descontar\n", CONSUMABLES[i]);
@@ -336,40 +409,65 @@ void decrementConsumable(size_t i, int amount) {
   String token = prefs.getString("token", "");
   prefs.end();
 
-  WiFiClientSecure secure;
-  WiFiClient plain;
-  HTTPClient http;
-  http.setTimeout(10000);
-  String endpoint = url + "/api/v1/consumables/" + String(ids[i]);
-  bool ok;
-  if (endpoint.startsWith("https://")) {
-    secure.setInsecure();
-    ok = http.begin(secure, endpoint);
+  if (activeUserId >= 0) {
+    String path = "/api/v1/consumables/" + String(ids[i]) + "/checkout";
+    String resp;
+    int code = snipeRequest(url, token, "POST", path,
+                            "{\"assigned_to\":" + String(activeUserId) +
+                                ",\"checkout_qty\":" + String(amount) + "}",
+                            resp);
+    Serial.printf("Checkout %dx %s a %s -> HTTP %d %.200s\n", amount, CONSUMABLES[i],
+                  activeUserName.c_str(), code, resp.c_str());
+
+    // Versiones antiguas de Snipe-IT ignoran checkout_qty y sacan solo 1 unidad
+    if (code == HTTP_CODE_OK && amount > 1) {
+      int after = fetchConsumable(url, token, CONSUMABLES[i], &ids[i], &totals[i], &companies[i]);
+      int missing = after >= 0 ? amount - (stock[i] - after) : 0;
+      for (int k = 0; k < missing; k++) {
+        if (snipeRequest(url, token, "POST", path,
+                         "{\"assigned_to\":" + String(activeUserId) + "}", resp) != HTTP_CODE_OK)
+          break;
+      }
+    }
   } else {
-    ok = http.begin(plain, endpoint);
+    String resp;
+    int code = snipeRequest(url, token, "PATCH", "/api/v1/consumables/" + String(ids[i]),
+                            "{\"qty\":" + String(totals[i] - amount) + "}", resp);
+    Serial.printf("Descontar %s -> HTTP %d %.200s\n", CONSUMABLES[i], code, resp.c_str());
   }
-  if (!ok) return;
 
-  http.addHeader("Authorization", "Bearer " + token);
-  http.addHeader("Accept", "application/json");
-  http.addHeader("Content-Type", "application/json");
-  int code = http.sendRequest("PATCH", "{\"qty\":" + String(totals[i] - amount) + "}");
-  String resp = http.getString();
-  http.end();
-  Serial.printf("Descontar %s -> HTTP %d %.200s\n", CONSUMABLES[i], code, resp.c_str());
+  int newStock = fetchConsumable(url, token, CONSUMABLES[i], &ids[i], &totals[i], &companies[i]);
+  if (newStock >= 0) stock[i] = newStock;
+  needsRedraw = true;
+}
 
-  if (code == HTTP_CODE_OK) {
-    int newStock = fetchConsumable(url, token, CONSUMABLES[i], &ids[i], &totals[i]);
-    if (newStock >= 0) stock[i] = newStock;
-    needsRedraw = true;
+void flushPending() {
+  for (size_t i = 0; i < NUM_CONSUMABLES; i++) {
+    if (pending[i] > 0) {
+      int n = pending[i];
+      pending[i] = 0;
+      decrementConsumable(i, n);
+    }
   }
+  lastPressAt = 0;
+  needsRedraw = true;
+}
+
+// Con usuario activo, debe pertenecer a la compañía del consumible
+bool canCheckout(size_t i) {
+  return activeUserId < 0 || companies[i] < 0 || companies[i] == activeUserCompany;
 }
 
 // Acumula una pulsación; no se puede pedir más de lo que queda
 void queueDecrement(size_t i) {
+  if (!canCheckout(i)) {
+    Serial.printf("%s: el usuario no pertenece a la compañía del consumible\n", CONSUMABLES[i]);
+    return;
+  }
   if (stock[i] < 0 || pending[i] >= stock[i]) return;
   pending[i]++;
   lastPressAt = millis();
+  lastUserActivityAt = millis();
   needsRedraw = true;
 }
 
@@ -385,21 +483,94 @@ void checkButtons() {
   if (M5.BtnC.wasClicked()) queueDecrement(2);
 
   // Envía los descuentos acumulados cuando dejan de llegar pulsaciones
-  if (lastPressAt != 0 && millis() - lastPressAt >= DEBOUNCE_MS) {
-    lastPressAt = 0;
-    for (size_t i = 0; i < NUM_CONSUMABLES; i++) {
-      if (pending[i] > 0) {
-        int n = pending[i];
-        pending[i] = 0;
-        decrementConsumable(i, n);
-      }
-    }
+  if (lastPressAt != 0 && millis() - lastPressAt >= DEBOUNCE_MS) flushPending();
+
+  // Vuelve al modo sin usuario tras un tiempo de inactividad
+  if ((activeUserId >= 0 || unknownCard) && millis() - lastUserActivityAt >= USER_TIMEOUT_MS) {
+    activeUserId = -1;
+    activeUserName = "";
+    unknownCard = false;
     needsRedraw = true;
   }
 }
 
+// Busca el usuario cuyo código (employee_num) coincide con el UID de la tarjeta
+bool lookupUser(const String &uid, int &userId, String &userName, int &userCompany) {
+  prefs.begin("snipeit", true);
+  String url = prefs.getString("url", "");
+  String token = prefs.getString("token", "");
+  prefs.end();
+  if (WiFi.status() != WL_CONNECTED || url.isEmpty() || token.isEmpty()) return false;
+
+  String body;
+  int code = snipeRequest(url, token, "GET", "/api/v1/users?limit=10&search=" + uid, "", body);
+  if (code != HTTP_CODE_OK) {
+    Serial.printf("Usuario %s -> HTTP %d\n", uid.c_str(), code);
+    return false;
+  }
+
+  JsonDocument filter;
+  filter["rows"][0]["id"] = true;
+  filter["rows"][0]["name"] = true;
+  filter["rows"][0]["employee_num"] = true;
+  filter["rows"][0]["company"]["id"] = true;
+  JsonDocument doc;
+  if (deserializeJson(doc, body, DeserializationOption::Filter(filter))) return false;
+
+  for (JsonObject row : doc["rows"].as<JsonArray>()) {
+    String num = row["employee_num"] | "";
+    if (num.equalsIgnoreCase(uid)) {
+      userId = row["id"] | -1;
+      userName = row["name"] | "";
+      userCompany = row["company"]["id"] | -1;
+      return userId >= 0;
+    }
+  }
+  return false;
+}
+
+void pollRfid() {
+  if (millis() - lastRfidPollAt < RFID_POLL_MS) return;
+  lastRfidPollAt = millis();
+  if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) return;
+
+  String uid;
+  for (byte i = 0; i < rfid.uid.size; i++) {
+    char b[4];
+    snprintf(b, sizeof(b), "%02X", rfid.uid.uidByte[i]);
+    uid += b;
+  }
+  rfid.PICC_HaltA();
+  lastUid = uid;
+  Serial.printf("Tarjeta UID: %s\n", uid.c_str());
+
+  // Los descuentos pendientes pertenecen al usuario anterior
+  if (lastPressAt != 0) flushPending();
+
+  int id;
+  String name;
+  int company = -1;
+  if (lookupUser(uid, id, name, company)) {
+    activeUserId = id;
+    activeUserCompany = company;
+    activeUserName = name;
+    unknownCard = false;
+    lastUserActivityAt = millis();
+    Serial.printf("Usuario activo: %s (%d)\n", name.c_str(), id);
+  } else {
+    activeUserId = -1;
+    activeUserName = "";
+    unknownCard = true;
+    lastUserActivityAt = millis();
+    Serial.println("Tarjeta sin usuario en Snipe-IT");
+  }
+  needsRedraw = true;
+}
+
 void setup() {
   M5.begin();
+  Wire.begin(21, 22, 400000);
+  rfid.PCD_Init();
   Serial.begin(115200);
   M5.BtnA.setHoldThresh(LONG_PRESS_MS);
   M5.Display.setBrightness(100);
@@ -418,5 +589,6 @@ void loop() {
     return;
   }
   if (millis() - lastRefreshAt >= REFRESH_MS) refreshStock();
+  pollRfid();
   if (needsRedraw) drawStock();
 }
